@@ -1,0 +1,30 @@
+﻿# Python
+__pycache__/
+*.pyc
+
+# Model Checkpoints
+*.pth
+*.pt
+*.bin
+*.ckpt
+
+# HuggingFace & logs
+hf_cache/
+data/glue_cache
+
+# Results & logs
+results/
+logs/
+*.out
+*.err
+
+# Python env
+mtl_env/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
