@@ -14,8 +14,10 @@ TASK_NAME_TO_ID = {
     "mnli": 3,
 }
 
+
 def get_tokenizer(model_name: str):
     return AutoTokenizer.from_pretrained(model_name)
+
 
 def _preprocess_function_builder(task_name: str, tokenizer, max_length: int):
     key1, key2 = TASK_CONFIG[task_name]["input_keys"]
@@ -23,19 +25,21 @@ def _preprocess_function_builder(task_name: str, tokenizer, max_length: int):
     def preprocess(example):
         text1 = example[key1]
         text2 = example[key2] if key2 is not None else None
+
         encoded = tokenizer(
             text1,
             text2,
             truncation=True,
             max_length=max_length,
         )
-        # encoded["labels"] = example["label"]
-        encoded["labels"] = int(example["label"])
+
+        encoded["labels"] = example["label"]
         encoded["task_name"] = task_name
         encoded["task_id"] = TASK_NAME_TO_ID[task_name]
         return encoded
 
     return preprocess
+
 
 def download_and_process_all(model_name: str, max_length: int, processed_dir: str):
     tokenizer = get_tokenizer(model_name)
@@ -43,6 +47,7 @@ def download_and_process_all(model_name: str, max_length: int, processed_dir: st
 
     for task_name in ["sst2", "cola", "qqp", "mnli"]:
         save_path = os.path.join(processed_dir, task_name)
+
         if os.path.exists(save_path):
             print(f"[skip] {task_name} already processed at {save_path}")
             continue
@@ -51,24 +56,28 @@ def download_and_process_all(model_name: str, max_length: int, processed_dir: st
         raw_ds = load_dataset("glue", task_name)
 
         preprocess_fn = _preprocess_function_builder(task_name, tokenizer, max_length)
+
         tokenized = raw_ds.map(
             preprocess_fn,
-            batched=True,
+            batched=False,
             remove_columns=raw_ds["train"].column_names
         )
+
         tokenized.save_to_disk(save_path)
         print(f"[saved] {task_name} -> {save_path}")
+
 
 def load_processed_task(task_name: str, processed_dir: str):
     path = os.path.join(processed_dir, task_name)
     ds = load_from_disk(path)
     return ds
 
+
 class TaskAwareCollator:
-    def __init__(self, tokenizer):
+    def _init_(self, tokenizer):
         self.base_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-    def __call__(self, features):
+    def _call_(self, features):
         task_ids = [f["task_id"] for f in features]
         task_names = [f["task_name"] for f in features]
 
@@ -84,9 +93,14 @@ class TaskAwareCollator:
         batch["task_name"] = task_names
         return batch
 
-def make_single_task_dataloaders(model_name: str, processed_dir: str,
-                                 train_batch_size: int, eval_batch_size: int,
-                                 num_workers: int = 0):
+
+def make_single_task_dataloaders(
+    model_name: str,
+    processed_dir: str,
+    train_batch_size: int,
+    eval_batch_size: int,
+    num_workers: int = 0,
+):
     tokenizer = get_tokenizer(model_name)
     collator = TaskAwareCollator(tokenizer)
 
@@ -116,39 +130,35 @@ def make_single_task_dataloaders(model_name: str, processed_dir: str,
                 num_workers=num_workers,
             ),
         }
+
     return loaders
 
+
 class RoundRobinMultiTaskIterator:
-    def __init__(self, task_loaders: Dict[str, DataLoader]):
+    def _init_(self, task_loaders: Dict[str, DataLoader]):
         self.task_names = list(task_loaders.keys())
         self.task_loaders = task_loaders
 
-    # def __iter__(self) -> Iterator:
-    #     iterators = {k: iter(v) for k, v in self.task_loaders.items()}
-    #     finished = set()
-
-    #     while len(finished) < len(self.task_names):
-    #         for task_name in self.task_names:
-    #             if task_name in finished:
-    #                 continue
-    #             try:
-    #                 batch = next(iterators[task_name])
-    #                 yield batch
-    #             except StopIteration:
-    #                 finished.add(task_name)
-
-    def __iter__(self) -> Iterator:
+    def _iter_(self) -> Iterator:
         iterators = {k: iter(v) for k, v in self.task_loaders.items()}
+        finished = set()
 
-        # 🔑 KEY LINE (this is what you asked about)
-        min_steps = min(len(loader) for loader in self.task_loaders.values())
-
-        for _ in range(min_steps):
+        while len(finished) < len(self.task_names):
             for task_name in self.task_names:
-                yield next(iterators[task_name])
+                if task_name in finished:
+                    continue
+                try:
+                    yield next(iterators[task_name])
+                except StopIteration:
+                    finished.add(task_name)
 
-def make_multitask_train_iterator(model_name: str, processed_dir: str,
-                                  train_batch_size: int, num_workers: int = 0):
+
+def make_multitask_train_iterator(
+    model_name: str,
+    processed_dir: str,
+    train_batch_size: int,
+    num_workers: int = 0,
+):
     loaders = make_single_task_dataloaders(
         model_name=model_name,
         processed_dir=processed_dir,
