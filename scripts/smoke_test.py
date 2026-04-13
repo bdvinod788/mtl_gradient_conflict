@@ -1,5 +1,7 @@
+import os
 import sys
-sys.path.append("src")
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
 from config import Config
 from data import make_single_task_dataloaders

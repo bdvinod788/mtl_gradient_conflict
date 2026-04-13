@@ -60,7 +60,7 @@ def download_and_process_all(model_name: str, max_length: int, processed_dir: st
         tokenized = raw_ds.map(
             preprocess_fn,
             batched=False,
-            remove_columns=raw_ds["train"].column_names
+            remove_columns=raw_ds["train"].column_names,
         )
 
         tokenized.save_to_disk(save_path)
@@ -69,15 +69,14 @@ def download_and_process_all(model_name: str, max_length: int, processed_dir: st
 
 def load_processed_task(task_name: str, processed_dir: str):
     path = os.path.join(processed_dir, task_name)
-    ds = load_from_disk(path)
-    return ds
+    return load_from_disk(path)
 
 
 class TaskAwareCollator:
-    def _init_(self, tokenizer):
+    def __init__(self, tokenizer):
         self.base_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-    def _call_(self, features):
+    def __call__(self, features):
         task_ids = [f["task_id"] for f in features]
         task_names = [f["task_name"] for f in features]
 
@@ -135,11 +134,11 @@ def make_single_task_dataloaders(
 
 
 class RoundRobinMultiTaskIterator:
-    def _init_(self, task_loaders: Dict[str, DataLoader]):
+    def __init__(self, task_loaders: Dict[str, DataLoader]):
         self.task_names = list(task_loaders.keys())
         self.task_loaders = task_loaders
 
-    def _iter_(self) -> Iterator:
+    def __iter__(self) -> Iterator:
         iterators = {k: iter(v) for k, v in self.task_loaders.items()}
         finished = set()
 
