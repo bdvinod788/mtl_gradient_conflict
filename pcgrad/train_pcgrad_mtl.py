@@ -497,7 +497,7 @@ def train(args):
     print(f"\nTraining complete. History saved to {history_path}")
 
     if use_wandb:
-        wandb.save(str(history_path))   # upload JSON to W&B artifacts
+        wandb.save(str(history_path), base_path=str(output_dir))  # upload JSON to W&B
         wandb.finish()
 
     return history
