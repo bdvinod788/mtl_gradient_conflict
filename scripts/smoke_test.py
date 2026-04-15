@@ -3,8 +3,8 @@ import sys
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from config import Config
-from data import make_single_task_dataloaders
+from config_old import Config
+from data_old import make_single_task_dataloaders
 
 if __name__ == "__main__":
     cfg = Config()

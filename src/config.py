@@ -11,13 +11,16 @@ class Config:
     epochs: int = 2
     warmup_ratio: float = 0.1
     seed: int = 42
-    num_workers: int = 2
+    num_workers: int = 0
     output_dir: str = "checkpoints"
     processed_dir: str = "processed"
 
 TASK_CONFIG = {
-    "sst2": {
-        "input_keys": ("sentence", None),
+    # Yelp Polarity replaces SST-2 for sentiment classification.
+    # Larger dataset (~560k train vs SST-2's ~67k) and same 2-class setup.
+    # Input field is "text"; splits are "train" and "test" (no validation split).
+    "yelp": {
+        "input_keys": ("text", None),
         "num_labels": 2,
     },
     "cola": {

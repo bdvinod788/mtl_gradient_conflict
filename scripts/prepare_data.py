@@ -1,7 +1,7 @@
 import sys
 sys.path.append("src")
 
-from config import Config
+from config_old import Config
 from data import download_and_process_all
 
 if __name__ == "__main__":
