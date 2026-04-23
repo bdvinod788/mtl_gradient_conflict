@@ -2,11 +2,11 @@
 train_pcgrad_mtl.py
 
 PCGrad MTL (Experiment 2):
-  - Shared DistilBERT encoder + 4 task heads (SST-2, QNLI, QQP, MNLI)
+  - Shared DistilBERT encoder + 4 task heads (Yelp, QNLI, QQP, MNLI)
   - At each step: one batch per ACTIVE task; gradients projected via PCGrad
     (Gradient Surgery) before each parameter update.
   - Per-task early stopping + head freezing — identical protocol to vanilla.
-  - Gradient signals (conflict rate, severity, variance) logged every epoch.
+  - Gradient signals (conflict rate, severity, variance, norm ratio, SNR) logged every epoch.
   - Weights & Biases logging built in (disable with --no_wandb).
 
 Key difference from vanilla:
@@ -44,7 +44,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from transformers import DistilBertTokenizerFast, get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup
 
 # W&B — imported lazily so the script still works without it
 # (pass --no_wandb to skip entirely)
@@ -57,7 +57,12 @@ except ImportError:
 # All imports are local to this folder — zero cross-directory dependencies
 from pcgrad import PCGrad
 from model import VanillaMTLModel, TASKS, TASK_NUM_LABELS
-from data import build_task_dataloaders, UniformMTLSampler
+from data import (
+    download_and_process_all,
+    make_single_task_dataloaders,
+    make_multitask_train_iterator,
+    TASK_NAME_TO_ID,
+)
 from gradient_signals import (
     compute_per_task_grads,
     compute_gradient_signals,
@@ -119,10 +124,26 @@ def evaluate(model, val_loaders, loss_fn, device):
 # ── Gradient signal logging ───────────────────────────────────────────────────
 
 def log_gradient_signals(model, train_loaders, loss_fn, device, n_batches=4):
+    """
+    Computes averaged gradient signals over n_batches rounds.
+
+    Each round collects one gradient snapshot per task (cloned CPU tensors,
+    independent of model grad buffers), then passes all snapshots to
+    compute_gradient_signals. model.zero_grad() is called once at the end.
+
+    Returns a dict with keys:
+        conflict_rate, conflict_severity, gradient_variance,
+        grad_norm_ratio, grad_snr, combined_gradient_score
+    """
     model.eval()
-    acc_rate, acc_sev, acc_var = 0.0, 0.0, 0.0
+
+    signal_keys = ["conflict_rate", "conflict_severity", "gradient_variance",
+                   "grad_norm_ratio", "grad_snr"]
+    acc = {k: 0.0 for k in signal_keys}
     n_measurements = 0
+
     task_iters = {task: iter(loader) for task, loader in train_loaders.items()}
+
     for _ in range(n_batches):
         task_grads = {}
         for task in TASKS:
@@ -131,21 +152,25 @@ def log_gradient_signals(model, train_loaders, loss_fn, device, n_batches=4):
             except StopIteration:
                 task_iters[task] = iter(train_loaders[task])
                 batch = next(task_iters[task])
-            grads = compute_per_task_grads(model, batch, task, loss_fn, device)
-            task_grads[task] = grads
-        rate, sev, var = compute_gradient_signals(task_grads)
-        acc_rate += rate
-        acc_sev  += sev
-        acc_var  += var
+            task_grads[task] = compute_per_task_grads(
+                model, batch, task, loss_fn, device
+            )
+
+        signals = compute_gradient_signals(task_grads)
+        for k in signal_keys:
+            acc[k] += signals[k]
         n_measurements += 1
-    if n_measurements > 0:
-        acc_rate /= n_measurements
-        acc_sev  /= n_measurements
-        acc_var  /= n_measurements
+
+    # Clean up model grad buffers once, after all snapshots are collected
     model.zero_grad()
     model.train()
-    score = combined_gradient_score(acc_rate, acc_sev, acc_var)
-    return acc_rate, acc_sev, acc_var, score
+
+    if n_measurements > 0:
+        for k in signal_keys:
+            acc[k] /= n_measurements
+
+    acc["combined_gradient_score"] = combined_gradient_score(acc)
+    return acc
 
 
 # ── Early-stopping helper ─────────────────────────────────────────────────────
@@ -204,37 +229,32 @@ def train(args):
         print(f"W&B run: {wandb.run.url}\n")
 
     # ── Model + data ──────────────────────────────────────────────────────────
-    tokenizer = DistilBertTokenizerFast.from_pretrained(args.model_name)
-    model     = VanillaMTLModel(model_name=args.model_name, dropout=args.dropout)
+    model = VanillaMTLModel(model_name=args.model_name, dropout=args.dropout)
     model.to(device)
 
     if use_wandb:
         wandb.watch(model, log="gradients", log_freq=200)
 
-    print("Loading training data...")
-    train_loaders = build_task_dataloaders(
-        tokenizer, split="train", batch_size=args.batch_size,
-        max_length=args.max_length, max_samples_per_task=args.max_train_samples,
-        num_workers=args.num_workers,
-    )
+    print("Preprocessing data (skips tasks already on disk)...")
+    download_and_process_all(args.model_name, args.max_length, args.processed_dir)
 
-    print("Loading validation data...")
-    val_loaders = build_task_dataloaders(
-        tokenizer, split="validation", batch_size=args.batch_size * 2,
-        max_length=args.max_length, max_samples_per_task=args.max_val_samples,
+    print("Loading dataloaders...")
+    all_loaders = make_single_task_dataloaders(
+        model_name=args.model_name,
+        processed_dir=args.processed_dir,
+        train_batch_size=args.batch_size,
+        eval_batch_size=args.batch_size * 2,
         num_workers=args.num_workers,
     )
+    train_loaders = {task: all_loaders[task]["train"] for task in TASKS}
+    val_loaders   = {task: all_loaders[task]["val"]   for task in TASKS}
 
     # ── Steps per epoch ────────────────────────────────────────────────────────
-    _sampler_ref = UniformMTLSampler(train_loaders)
     if args.steps_per_epoch > 0:
         steps_per_epoch = args.steps_per_epoch
-        print(
-            f"Using fixed steps_per_epoch={steps_per_epoch} "
-            f"(dataset-size-based default: {_sampler_ref.steps_per_epoch()})"
-        )
+        print(f"Using fixed steps_per_epoch={steps_per_epoch}")
     else:
-        steps_per_epoch = _sampler_ref.steps_per_epoch()
+        steps_per_epoch = max(len(dl) for dl in train_loaders.values())
         print(f"Using dataset-size-based steps_per_epoch={steps_per_epoch}")
 
     total_steps = steps_per_epoch * args.num_epochs
@@ -291,7 +311,7 @@ def train(args):
         epoch_conflict_count = 0
         epoch_steps_taken    = 0
 
-        task_iters = _make_cycling_iterators(train_loaders)
+        task_iters = {task: cycle(loader) for task, loader in train_loaders.items()}
 
         # ── Step loop ─────────────────────────────────────────────────────────
         for step in range(steps_per_epoch):
@@ -405,7 +425,7 @@ def train(args):
         avg_val_loss, per_task_val = evaluate(model, val_loaders, loss_fn, device)
 
         print("  Computing gradient signals...")
-        rate, sev, var, score = log_gradient_signals(
+        grad_signals = log_gradient_signals(
             model, train_loaders, loss_fn, device, n_batches=args.grad_signal_batches
         )
 
@@ -413,7 +433,6 @@ def train(args):
         conflicts_per_step = (
             epoch_conflict_count / epoch_steps_taken if epoch_steps_taken else 0.0
         )
-
         newly_frozen, any_improved = check_and_freeze(
             per_task_val, best_per_task_loss, patience_counters,
             frozen_tasks, model, args, label=f"epoch {epoch}",
@@ -436,8 +455,13 @@ def train(args):
                 f"acc: {m['acc']*100:.2f}%  [{status}]"
             )
         print(
-            f"  Gradient Signals -> conflict_rate: {rate:.4f}  "
-            f"severity: {sev:.4f}  variance: {var:.6f}  score: {score:.4f}"
+            f"  Gradient Signals -> "
+            f"conflict_rate: {grad_signals['conflict_rate']:.4f}  "
+            f"severity: {grad_signals['conflict_severity']:.4f}  "
+            f"variance: {grad_signals['gradient_variance']:.6f}  "
+            f"norm_ratio: {grad_signals['grad_norm_ratio']:.4f}  "
+            f"snr: {grad_signals['grad_snr']:.4f}  "
+            f"score: {grad_signals['combined_gradient_score']:.4f}"
         )
         print(
             f"  PCGrad Conflicts -> {epoch_conflict_count} total  "
@@ -455,10 +479,12 @@ def train(args):
             "epoch/time_s":                   epoch_time,
             "epoch/n_frozen_tasks":           len(frozen_tasks),
             # gradient signals
-            "gradient/conflict_rate":         rate,
-            "gradient/conflict_severity":     sev,
-            "gradient/variance":              var,
-            "gradient/combined_score":        score,
+            "gradient/conflict_rate":         grad_signals["conflict_rate"],
+            "gradient/conflict_severity":     grad_signals["conflict_severity"],
+            "gradient/variance":              grad_signals["gradient_variance"],
+            "gradient/norm_ratio":            grad_signals["grad_norm_ratio"],
+            "gradient/snr":                   grad_signals["grad_snr"],
+            "gradient/combined_score":        grad_signals["combined_gradient_score"],
             # pcgrad-specific
             "pcgrad/conflicts_total":         epoch_conflict_count,
             "pcgrad/conflicts_per_step":      conflicts_per_step,
@@ -469,20 +495,22 @@ def train(args):
         _wandb_log(epoch_log, step=global_step, use_wandb=use_wandb)
 
         history.append({
-            "epoch":                      epoch,
-            "avg_val_loss":               avg_val_loss,
-            "per_task_val":               per_task_val,
-            "best_per_task_loss":         dict(best_per_task_loss),
-            "patience_counters":          dict(patience_counters),
-            "frozen_tasks":               list(frozen_tasks),
-            "mid_epoch_checks":           mid_epoch_checks,
-            "gradient_conflict_rate":     rate,
-            "gradient_conflict_severity": sev,
-            "gradient_variance":          var,
-            "combined_gradient_score":    score,
-            "pcgrad_conflicts_total":     epoch_conflict_count,
-            "pcgrad_conflicts_per_step":  round(conflicts_per_step, 4),
-            "epoch_time_s":               round(epoch_time, 1),
+            "epoch":                          epoch,
+            "avg_val_loss":                   avg_val_loss,
+            "per_task_val":                   per_task_val,
+            "best_per_task_loss":             dict(best_per_task_loss),
+            "patience_counters":              dict(patience_counters),
+            "frozen_tasks":                   list(frozen_tasks),
+            "mid_epoch_checks":               mid_epoch_checks,
+            "conflict_rate":                  grad_signals["conflict_rate"],
+            "conflict_severity":              grad_signals["conflict_severity"],
+            "gradient_variance":              grad_signals["gradient_variance"],
+            "grad_norm_ratio":                grad_signals["grad_norm_ratio"],
+            "grad_snr":                       grad_signals["grad_snr"],
+            "combined_gradient_score":        grad_signals["combined_gradient_score"],
+            "pcgrad_conflicts_total":         epoch_conflict_count,
+            "pcgrad_conflicts_per_step":      round(conflicts_per_step, 4),
+            "epoch_time_s":                   round(epoch_time, 1),
         })
 
         if frozen_tasks == set(TASKS):
@@ -512,6 +540,8 @@ def parse_args():
     parser.add_argument("--dropout",     type=float, default=0.1)
     parser.add_argument("--max_length",  type=int,   default=128)
     # Data
+    parser.add_argument("--processed_dir",       default="./processed_data",
+                        help="Directory for tokenized/cached dataset splits.")
     parser.add_argument("--max_train_samples", type=int, default=None,
                         help="Cap training examples per task. Use 500 for smoke test.")
     parser.add_argument("--max_val_samples",   type=int, default=None,

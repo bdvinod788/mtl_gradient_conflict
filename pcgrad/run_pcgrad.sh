@@ -15,6 +15,7 @@
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PCGrad MTL Training Job — CSCI 567
+# Tasks: Yelp Polarity, QNLI, QQP, MNLI
 # Submit:  sbatch pcgrad/run_pcgrad.sh   (from mtl_gradient_conflict/)
 # Monitor: squeue --user=bandrede
 # Log:     tail -f /scratch1/bandrede/logs/pcgrad_<JOBID>.out
@@ -64,6 +65,7 @@ python train_pcgrad_mtl.py \
     --steps_per_epoch     7000 \
     --eval_every          1000 \
     --patience            5    \
+    --processed_dir       /scratch1/bandrede/mtl_processed \
     --output_dir          "$OUTPUT_DIR" \
     --wandb_project       csci567-mtl   \
     --wandb_run           "pcgrad_${DATE}"

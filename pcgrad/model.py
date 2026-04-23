@@ -1,7 +1,7 @@
 """
 model.py
 MTL Model: Shared DistilBERT encoder + 4 task-specific classification heads.
-Tasks: SST-2 (2-class), QNLI (2-class), QQP (2-class), MNLI (3-class)
+Tasks: Yelp Polarity (2-class), QNLI (2-class), QQP (2-class), MNLI (3-class)
 
 Identical to vanilla/model.py — kept as a local copy so the pcgrad/ folder
 is fully self-contained and runnable without depending on any sibling directory.
@@ -12,7 +12,7 @@ import torch.nn as nn
 from transformers import DistilBertModel
 
 TASK_NUM_LABELS = {
-    "sst2": 2,
+    "yelp": 2,
     "qnli": 2,
     "qqp":  2,
     "mnli": 3,

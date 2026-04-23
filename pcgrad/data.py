@@ -1,171 +1,236 @@
 """
 data.py
-Loads GLUE tasks from HuggingFace datasets and provides a uniform-sampling
+
+Loads tasks from HuggingFace datasets (Yelp Polarity, QNLI, QQP, MNLI),
+tokenizes and saves them to disk, then provides a uniform-sampling
 multi-task dataloader that cycles through tasks to handle size imbalance.
 
 Identical to vanilla/data.py — kept as a local copy so the pcgrad/ folder
 is fully self-contained and runnable without depending on any sibling directory.
+
+Key design decisions
+--------------------
+* Eager preprocessing + disk caching via `download_and_process_all` — tokens are
+  computed once and reused across runs.  The cache is located at `--processed_dir`.
+* Dynamic padding via DataCollatorWithPadding (no fixed max_length padding in
+  the collator), which keeps sequences short and training fast.
+* task_id / task_name are embedded into every batch dict so the training loop
+  can branch on task without extra bookkeeping.
+* Yelp Polarity has no validation split — the last YELP_VAL_SIZE examples of
+  the train split are carved out and saved as "validation".
 """
 
-from __future__ import annotations
+import os
 import random
 from itertools import cycle
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator
 
 import torch
-from torch.utils.data import DataLoader, Dataset
-from datasets import load_dataset
-from transformers import DistilBertTokenizerFast
+from torch.utils.data import DataLoader
+from datasets import load_dataset, load_from_disk
+from transformers import AutoTokenizer, DataCollatorWithPadding
 
-from model import TASKS
+from config import TASK_CONFIG
 
-# ── Task-specific field extractors ────────────────────────────────────────────
-# Each returns (sentence_a, sentence_b_or_None, label)
-
-def _extract_sst2(example):
-    return example["sentence"], None, example["label"]
-
-def _extract_qnli(example):
-    return example["question"], example["sentence"], example["label"]
-
-def _extract_qqp(example):
-    return example["question1"], example["question2"], example["label"]
-
-def _extract_mnli(example):
-    return example["premise"], example["hypothesis"], example["label"]
-
-EXTRACTORS = {
-    "sst2": _extract_sst2,
-    "qnli": _extract_qnli,
-    "qqp":  _extract_qqp,
-    "mnli": _extract_mnli,
+TASK_NAME_TO_ID = {
+    "yelp": 0,  # Yelp Polarity — binary sentiment classification
+    "qnli": 1,  # GLUE QNLI — question-answer natural language inference
+    "qqp":  2,  # GLUE QQP — question paraphrase detection
+    "mnli": 3,  # GLUE MNLI — 3-class entailment
 }
 
-# HuggingFace dataset names & config keys
-HF_CONFIGS = {
-    "sst2": ("glue", "sst2"),
-    "qnli": ("glue", "qnli"),
-    "qqp":  ("glue", "qqp"),
-    "mnli": ("glue", "mnli"),
+# HuggingFace loader config per task.
+# Yelp Polarity has no validation split — a 10k holdout is carved from train.
+DATASET_CONFIG = {
+    "yelp": {"hf_path": "yelp_polarity", "hf_name": None,   "val_split": "validation"},
+    "qnli": {"hf_path": "glue",          "hf_name": "qnli", "val_split": "validation"},
+    "qqp":  {"hf_path": "glue",          "hf_name": "qqp",  "val_split": "validation"},
+    "mnli": {"hf_path": "glue",          "hf_name": "mnli", "val_split": "validation_matched"},
 }
 
-# MNLI validation split name
-MNLI_VAL_SPLIT = "validation_matched"
+YELP_VAL_SIZE = 10_000
 
 
-class GLUETaskDataset(Dataset):
-    """
-    Wraps a single GLUE task split as a torch Dataset.
-    Tokenization is LAZY — done per example in __getitem__ rather than
-    upfront in __init__. This keeps RAM usage flat regardless of dataset
-    size, fixing OOM kills on large tasks like QQP and MNLI.
-    """
+def get_tokenizer(model_name: str):
+    return AutoTokenizer.from_pretrained(model_name)
 
-    def __init__(
-        self,
-        task: str,
-        split: str,
-        tokenizer: DistilBertTokenizerFast,
-        max_length: int = 128,
-        max_samples: Optional[int] = None,
-    ):
-        hf_path, hf_name = HF_CONFIGS[task]
 
-        actual_split = split
-        if task == "mnli" and split == "validation":
-            actual_split = MNLI_VAL_SPLIT
+def _preprocess_function_builder(task_name: str, tokenizer, max_length: int):
+    key1, key2 = TASK_CONFIG[task_name]["input_keys"]
 
-        raw = load_dataset(hf_path, hf_name, split=actual_split)
+    def preprocess(example):
+        text1 = example[key1]
+        text2 = example[key2] if key2 is not None else None
 
-        if max_samples is not None:
-            raw = raw.select(range(min(max_samples, len(raw))))
-
-        # Filter out unlabelled test rows (label == -1) upfront
-        raw = raw.filter(lambda ex: EXTRACTORS[task](ex)[2] != -1)
-
-        # Store raw text + labels only — no tokenization yet
-        self.raw = raw
-        self.task = task
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.extractor = EXTRACTORS[task]
-
-    def __len__(self):
-        return len(self.raw)
-
-    def __getitem__(self, idx):
-        ex = self.raw[idx]
-        sent_a, sent_b, label = self.extractor(ex)
-
-        enc = self.tokenizer(
-            sent_a,
-            sent_b,
-            max_length=self.max_length,
-            padding="max_length",
+        encoded = tokenizer(
+            text1,
+            text2,
             truncation=True,
-            return_tensors="pt",
+            max_length=max_length,
         )
 
-        return {
-            "input_ids":      enc["input_ids"].squeeze(0),
-            "attention_mask": enc["attention_mask"].squeeze(0),
-            "labels":         torch.tensor(label, dtype=torch.long),
+        encoded["labels"]    = example["label"]
+        encoded["task_name"] = task_name
+        encoded["task_id"]   = TASK_NAME_TO_ID[task_name]
+        return encoded
+
+    return preprocess
+
+
+def download_and_process_all(model_name: str, max_length: int, processed_dir: str):
+    """
+    Downloads and tokenizes all 4 tasks, saves to disk.
+    Skips tasks that are already processed.
+
+    Tasks: Yelp Polarity (sentiment), QNLI, QQP, MNLI.
+    Note: Yelp Polarity is loaded from "yelp_polarity"; GLUE tasks from "glue".
+    Note: Yelp has no validation split — last YELP_VAL_SIZE examples of train
+          are carved out and saved as a "validation" split.
+    """
+    tokenizer = get_tokenizer(model_name)
+    os.makedirs(processed_dir, exist_ok=True)
+
+    for task_name in TASK_NAME_TO_ID:
+        save_path = os.path.join(processed_dir, task_name)
+
+        if os.path.exists(save_path):
+            print(f"[skip] {task_name} already processed at {save_path}")
+            continue
+
+        print(f"[load] {task_name}")
+        ds_cfg = DATASET_CONFIG[task_name]
+
+        if ds_cfg["hf_name"] is not None:
+            raw_ds = load_dataset(ds_cfg["hf_path"], ds_cfg["hf_name"])
+        else:
+            raw_ds = load_dataset(ds_cfg["hf_path"])
+
+        preprocess_fn = _preprocess_function_builder(task_name, tokenizer, max_length)
+
+        tokenized = raw_ds.map(
+            preprocess_fn,
+            batched=False,
+            remove_columns=raw_ds["train"].column_names,
+        )
+
+        # Yelp has no validation split — carve last YELP_VAL_SIZE rows from train
+        if task_name == "yelp":
+            full_train = tokenized["train"]
+            total = len(full_train)
+            tokenized["train"]      = full_train.select(range(0, total - YELP_VAL_SIZE))
+            tokenized["validation"] = full_train.select(range(total - YELP_VAL_SIZE, total))
+
+        tokenized.save_to_disk(save_path)
+        print(f"[saved] {task_name} -> {save_path}")
+
+
+def load_processed_task(task_name: str, processed_dir: str):
+    path = os.path.join(processed_dir, task_name)
+    return load_from_disk(path)
+
+
+class TaskAwareCollator:
+    """
+    Handles dynamic padding via DataCollatorWithPadding and
+    restores task_id / task_name into the final batch.
+    """
+    def __init__(self, tokenizer):
+        self.base_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+
+    def __call__(self, features):
+        task_ids   = [f["task_id"]   for f in features]
+        task_names = [f["task_name"] for f in features]
+
+        stripped = []
+        for f in features:
+            x = dict(f)
+            x.pop("task_name", None)
+            x.pop("task_id",   None)
+            stripped.append(x)
+
+        batch = self.base_collator(stripped)
+        batch["task_id"]   = torch.tensor(task_ids, dtype=torch.long)
+        batch["task_name"] = task_names
+        return batch
+
+
+def make_single_task_dataloaders(
+    model_name: str,
+    processed_dir: str,
+    train_batch_size: int,
+    eval_batch_size: int,
+    num_workers: int = 0,
+) -> Dict[str, Dict[str, DataLoader]]:
+    """
+    Returns {task_name: {"train": DataLoader, "val": DataLoader}}
+    for all 4 tasks. Val split is task-specific (see DATASET_CONFIG).
+    """
+    tokenizer = get_tokenizer(model_name)
+    collator  = TaskAwareCollator(tokenizer)
+
+    loaders = {}
+    for task_name in TASK_NAME_TO_ID:
+        ds        = load_processed_task(task_name, processed_dir)
+        val_split = DATASET_CONFIG[task_name]["val_split"]
+
+        loaders[task_name] = {
+            "train": DataLoader(
+                ds["train"],
+                batch_size=train_batch_size,
+                shuffle=True,
+                collate_fn=collator,
+                num_workers=num_workers,
+            ),
+            "val": DataLoader(
+                ds[val_split],
+                batch_size=eval_batch_size,
+                shuffle=False,
+                collate_fn=collator,
+                num_workers=num_workers,
+            ),
         }
 
-
-def build_task_dataloaders(
-    tokenizer: DistilBertTokenizerFast,
-    split: str = "train",
-    batch_size: int = 32,
-    max_length: int = 128,
-    max_samples_per_task: Optional[int] = None,
-    num_workers: int = 2,
-) -> Dict[str, DataLoader]:
-    """Returns a dict of {task: DataLoader} for the given split."""
-    loaders = {}
-    for task in TASKS:
-        ds = GLUETaskDataset(
-            task=task,
-            split=split,
-            tokenizer=tokenizer,
-            max_length=max_length,
-            max_samples=max_samples_per_task,
-        )
-        shuffle = (split == "train")
-        loaders[task] = DataLoader(
-            ds,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
-        )
     return loaders
 
 
-class UniformMTLSampler:
-    """
-    Uniform task sampler: at each step, randomly pick a task and yield
-    the next batch from that task's dataloader (cycling infinitely).
-    Handles dataset size imbalance as described in the proposal.
-    """
-
+class UniformMultiTaskIterator:
     def __init__(self, task_loaders: Dict[str, DataLoader]):
         self.task_loaders = task_loaders
-        self._iterators: Dict[str, Iterator] = {
-            task: cycle(loader) for task, loader in task_loaders.items()
-        }
         self.tasks = list(task_loaders.keys())
+        self._iterators = {task: iter(loader) for task, loader in task_loaders.items()}
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator:
         return self
 
     def __next__(self):
         task = random.choice(self.tasks)
-        batch = next(self._iterators[task])
-        return task, batch
+        try:
+            batch = next(self._iterators[task])
+        except StopIteration:
+            self._iterators[task] = iter(self.task_loaders[task])
+            batch = next(self._iterators[task])
+        return batch
 
     def steps_per_epoch(self) -> int:
-        """
-        One epoch = one pass through the largest task dataset.
-        """
         return max(len(loader) for loader in self.task_loaders.values())
+
+
+def make_multitask_train_iterator(
+    model_name: str,
+    processed_dir: str,
+    train_batch_size: int,
+    num_workers: int = 0,
+) -> UniformMultiTaskIterator:
+    """
+    Builds per-task train dataloaders and wraps them in
+    UniformMultiTaskIterator for balanced multitask training.
+    """
+    loaders = make_single_task_dataloaders(
+        model_name=model_name,
+        processed_dir=processed_dir,
+        train_batch_size=train_batch_size,
+        eval_batch_size=train_batch_size,
+        num_workers=num_workers,
+    )
+    train_loaders = {k: v["train"] for k, v in loaders.items()}
+    return UniformMultiTaskIterator(train_loaders)
