@@ -371,7 +371,8 @@ def train(args):
                     "train/n_frozen_tasks":      len(frozen_tasks),
                 }
                 for t in TASKS:
-                    step_log[f"train/loss_{t}"] = avg_losses[t]
+                    step_log[f"train/loss_{t}"]   = avg_losses[t]
+                    step_log[f"train/frozen_{t}"] = int(t in frozen_tasks)
                 _wandb_log(step_log, step=global_step, use_wandb=use_wandb)
 
             # ── Mid-epoch validation ──────────────────────────────────────────
@@ -403,8 +404,9 @@ def train(args):
                     "val/n_frozen":    len(frozen_tasks),
                 }
                 for t, m in per_task_val.items():
-                    val_log[f"val/loss_{t}"] = m["loss"]
-                    val_log[f"val/acc_{t}"]  = m["acc"] * 100
+                    val_log[f"val/loss_{t}"]   = m["loss"]
+                    val_log[f"val/acc_{t}"]    = m["acc"] * 100
+                    val_log[f"val/frozen_{t}"] = int(t in frozen_tasks)
                 _wandb_log(val_log, step=global_step, use_wandb=use_wandb)
 
                 mid_epoch_checks.append({
@@ -490,8 +492,9 @@ def train(args):
             "pcgrad/conflicts_per_step":      conflicts_per_step,
         }
         for t, m in per_task_val.items():
-            epoch_log[f"epoch/val_loss_{t}"] = m["loss"]
-            epoch_log[f"epoch/val_acc_{t}"]  = m["acc"] * 100
+            epoch_log[f"epoch/val_loss_{t}"]  = m["loss"]
+            epoch_log[f"epoch/val_acc_{t}"]   = m["acc"] * 100
+            epoch_log[f"epoch/frozen_{t}"]    = int(t in frozen_tasks)
         _wandb_log(epoch_log, step=global_step, use_wandb=use_wandb)
 
         history.append({
