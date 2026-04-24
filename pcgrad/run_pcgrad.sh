@@ -60,7 +60,7 @@ cd /home1/bandrede/mtl_gradient_conflict/pcgrad
 python train_pcgrad_mtl.py \
     --batch_size          32   \
     --num_epochs          20   \
-    --num_workers         4    \
+    --num_workers         2    \
     --grad_signal_batches 4    \
     --steps_per_epoch     7000 \
     --eval_every          1000 \
