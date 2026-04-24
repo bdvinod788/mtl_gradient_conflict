@@ -44,6 +44,10 @@ export HF_DATASETS_CACHE=/scratch1/bandrede/hf_cache/datasets
 export TRANSFORMERS_CACHE=/scratch1/bandrede/hf_cache
 export HF_HUB_CACHE=/scratch1/bandrede/hf_cache/hub
 
+# Redirect PyTorch temp files away from the tiny /tmp ramdisk
+export TMPDIR=/scratch1/bandrede/tmp
+mkdir -p "$TMPDIR"
+
 # ── 3. Timestamped output directory ──────────────────────────────────────────
 DATE=$(date +%m%d_%H%M)
 OUTPUT_DIR=/scratch1/bandrede/mtl_outputs/pcgrad_${DATE}_job${SLURM_JOB_ID}
@@ -61,7 +65,7 @@ ulimit -n 65536   # raise open-file limit to avoid "too many open files" with Da
 python train_pcgrad_mtl.py \
     --batch_size          32   \
     --num_epochs          20   \
-    --num_workers         2    \
+    --num_workers         0    \
     --grad_signal_batches 4    \
     --steps_per_epoch     7000 \
     --eval_every          1000 \
