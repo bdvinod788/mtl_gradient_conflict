@@ -22,7 +22,6 @@ Key design decisions
 
 import os
 import random
-from itertools import cycle
 from typing import Dict, Iterator
 
 import torch

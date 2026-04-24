@@ -22,7 +22,7 @@ folder is fully self-contained and runnable without depending on any sibling dir
 """
 
 from __future__ import annotations
-from typing import Dict, Tuple
+from typing import Dict
 
 import torch
 import torch.nn as nn

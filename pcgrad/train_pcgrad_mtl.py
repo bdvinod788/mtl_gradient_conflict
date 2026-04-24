@@ -14,18 +14,19 @@ Key difference from vanilla:
   PCGrad  : collect ONE BATCH per active task → forward all → pc_backward
             (projects each task's gradient to remove conflicting components) → step
 
-Smoke-test (small sample, local):
+Smoke-test (no W&B, few steps, local):
     python train_pcgrad_mtl.py \\
-        --max_train_samples 500 --max_val_samples 200 \\
+        --processed_dir ./processed_data \\
         --batch_size 16 --num_epochs 2 --num_workers 0 \\
         --steps_per_epoch 50 --eval_every 25 \\
         --grad_signal_batches 2 \\
         --output_dir ./outputs/smoke_test \\
-        --wandb_project csci567-mtl --wandb_run pcgrad_smoke
+        --no_wandb
 
 Full run on CARC:
     python train_pcgrad_mtl.py \\
-        --batch_size 32 --num_epochs 20 --num_workers 4 \\
+        --processed_dir /scratch1/$USER/mtl_processed \\
+        --batch_size 32 --num_epochs 20 --num_workers 2 \\
         --grad_signal_batches 4 --steps_per_epoch 7000 \\
         --eval_every 1000 --patience 5 \\
         --output_dir /scratch1/$USER/mtl_outputs/pcgrad_mtl_<date> \\
@@ -42,6 +43,8 @@ from typing import Dict, List, Set, Tuple
 
 import numpy as np
 import torch
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')  # avoids "too many open files" on CARC
 import torch.nn as nn
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
@@ -60,8 +63,6 @@ from model import VanillaMTLModel, TASKS, TASK_NUM_LABELS
 from data import (
     download_and_process_all,
     make_single_task_dataloaders,
-    make_multitask_train_iterator,
-    TASK_NAME_TO_ID,
 )
 from gradient_signals import (
     compute_per_task_grads,
@@ -543,14 +544,10 @@ def parse_args():
     parser.add_argument("--dropout",     type=float, default=0.1)
     parser.add_argument("--max_length",  type=int,   default=128)
     # Data
-    parser.add_argument("--processed_dir",       default="./processed_data",
+    parser.add_argument("--processed_dir", default="./processed_data",
                         help="Directory for tokenized/cached dataset splits.")
-    parser.add_argument("--max_train_samples", type=int, default=None,
-                        help="Cap training examples per task. Use 500 for smoke test.")
-    parser.add_argument("--max_val_samples",   type=int, default=None,
-                        help="Cap validation examples per task. Use 200 for smoke test.")
-    parser.add_argument("--num_workers",       type=int, default=2,
-                        help="DataLoader workers. Use 0 on Windows to avoid issues.")
+    parser.add_argument("--num_workers",   type=int, default=2,
+                        help="DataLoader workers. Use 0 on Windows/local to avoid issues.")
     # Training
     parser.add_argument("--batch_size",        type=int,   default=32,
                         help="Batch size per task per step.")

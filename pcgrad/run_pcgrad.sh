@@ -57,6 +57,7 @@ echo "--------------------------------------------------------"
 cd /home1/bandrede/mtl_gradient_conflict/pcgrad
 
 # ── 5. Run training ───────────────────────────────────────────────────────────
+ulimit -n 65536   # raise open-file limit to avoid "too many open files" with DataLoader workers
 python train_pcgrad_mtl.py \
     --batch_size          32   \
     --num_epochs          20   \
