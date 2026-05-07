@@ -18,7 +18,7 @@ Smoke-test (no W&B, few steps, local):
     python train_pcgrad_mtl.py \\
         --processed_dir ./processed_data \\
         --batch_size 16 --num_epochs 2 --num_workers 0 \\
-        --steps_per_epoch 50 --eval_every 25 \\
+        --steps_per_epoch 50 --eval_every 5 \\
         --grad_signal_batches 2 \\
         --output_dir ./outputs/smoke_test \\
         --no_wandb
@@ -27,8 +27,8 @@ Full run on CARC:
     python train_pcgrad_mtl.py \\
         --processed_dir /scratch1/$USER/mtl_processed \\
         --batch_size 32 --num_epochs 20 --num_workers 2 \\
-        --grad_signal_batches 4 --steps_per_epoch 7000 \\
-        --eval_every 1000 --patience 5 \\
+        --grad_signal_batches 4 --steps_per_epoch 1000 \\
+        --eval_every 100 --patience 5 \\
         --output_dir /scratch1/$USER/mtl_outputs/pcgrad_mtl_<date> \\
         --wandb_project csci567-mtl --wandb_run pcgrad_full
 """
@@ -249,6 +249,7 @@ def train(args):
     )
     train_loaders = {task: all_loaders[task]["train"] for task in TASKS}
     val_loaders   = {task: all_loaders[task]["val"]   for task in TASKS}
+    test_loaders  = {task: all_loaders[task]["test"]  for task in TASKS}
 
     # ── Steps per epoch ────────────────────────────────────────────────────────
     if args.steps_per_epoch > 0:
@@ -412,6 +413,7 @@ def train(args):
 
                 mid_epoch_checks.append({
                     "step":                    step + 1,
+                    "global_step":             global_step,
                     "avg_val_loss":            avg_val_loss,
                     "per_task_val":            per_task_val,
                     "frozen_tasks":            list(frozen_tasks),
@@ -523,13 +525,37 @@ def train(args):
 
         print()
 
+    # ── Final test-set evaluation ─────────────────────────────────────────────
+    print("\nEvaluating on held-out test set...")
+    _, per_task_test = evaluate(model, test_loaders, loss_fn, device)
+    avg_test_loss = float(np.mean([m["loss"] for m in per_task_test.values()]))
+    print(f"  Avg Test Loss: {avg_test_loss:.4f}")
+    for task, m in per_task_test.items():
+        print(f"  {task.upper():6s} -> loss: {m['loss']:.4f}  acc: {m['acc']*100:.2f}%")
+
+    test_results = {
+        "avg_test_loss": avg_test_loss,
+        "per_task_test": per_task_test,
+    }
+    test_path = output_dir / "test_results.json"
+    with open(test_path, "w") as f:
+        json.dump(test_results, f, indent=2)
+    print(f"  Test results saved to {test_path}")
+
+    if use_wandb:
+        test_log = {"test/avg_loss": avg_test_loss}
+        for task, m in per_task_test.items():
+            test_log[f"test/loss_{task}"] = m["loss"]
+            test_log[f"test/acc_{task}"]  = m["acc"] * 100
+        _wandb_log(test_log, step=global_step, use_wandb=use_wandb)
+
     history_path = output_dir / "training_history.json"
     with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
-    print(f"\nTraining complete. History saved to {history_path}")
+    print(f"Training history saved to {history_path}")
 
     if use_wandb:
-        wandb.save(str(history_path), base_path=str(output_dir))  # upload JSON to W&B
+        wandb.save(str(history_path), base_path=str(output_dir))
         wandb.finish()
 
     return history
@@ -559,9 +585,9 @@ def parse_args():
     parser.add_argument("--patience",          type=int,   default=5)
     parser.add_argument("--min_delta",         type=float, default=1e-4)
     # Epoch / validation schedule
-    parser.add_argument("--steps_per_epoch",   type=int,   default=7000,
+    parser.add_argument("--steps_per_epoch",   type=int,   default=1000,
                         help="Fixed steps per epoch. Use 50 for smoke test.")
-    parser.add_argument("--eval_every",        type=int,   default=1000,
+    parser.add_argument("--eval_every",        type=int,   default=100,
                         help="Validate every N steps. Use 25 for smoke test.")
     parser.add_argument("--grad_signal_batches", type=int, default=4,
                         help="Batches used to estimate gradient signals. Use 2 for smoke test.")

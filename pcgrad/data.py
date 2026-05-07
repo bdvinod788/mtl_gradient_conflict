@@ -1,23 +1,18 @@
 """
-data.py
+data.py  (PCGrad version)
 
-Loads tasks from HuggingFace datasets (Yelp Polarity, QNLI, QQP, MNLI),
-tokenizes and saves them to disk, then provides a uniform-sampling
-multi-task dataloader that cycles through tasks to handle size imbalance.
+Loads tasks from HuggingFace (Yelp Polarity, QNLI, QQP, MNLI), tokenizes, and
+saves to disk with a reproducible 60 / 20 / 20 train / val / test split carved
+entirely from the HuggingFace training split (GLUE test sets have no labels).
 
-Identical to vanilla/data.py — kept as a local copy so the pcgrad/ folder
-is fully self-contained and runnable without depending on any sibling directory.
+Split ratios
+------------
+  train : 60 %   used during training
+  val   : 20 %   used for mid-epoch and epoch-end evaluation
+  test  : 20 %   held out — evaluated once after training completes
 
-Key design decisions
---------------------
-* Eager preprocessing + disk caching via `download_and_process_all` — tokens are
-  computed once and reused across runs.  The cache is located at `--processed_dir`.
-* Dynamic padding via DataCollatorWithPadding (no fixed max_length padding in
-  the collator), which keeps sequences short and training fast.
-* task_id / task_name are embedded into every batch dict so the training loop
-  can branch on task without extra bookkeeping.
-* Yelp Polarity has no validation split — the last YELP_VAL_SIZE examples of
-  the train split are carved out and saved as "validation".
+Identical interface to the previous version; `make_single_task_dataloaders`
+now returns an extra "test" key in each task's dict.
 """
 
 import os
@@ -26,28 +21,29 @@ from typing import Dict, Iterator
 
 import torch
 from torch.utils.data import DataLoader
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset, load_from_disk, DatasetDict
 from transformers import AutoTokenizer, DataCollatorWithPadding
 
 from config import TASK_CONFIG
 
 TASK_NAME_TO_ID = {
-    "yelp": 0,  # Yelp Polarity — binary sentiment classification
-    "qnli": 1,  # GLUE QNLI — question-answer natural language inference
-    "qqp":  2,  # GLUE QQP — question paraphrase detection
-    "mnli": 3,  # GLUE MNLI — 3-class entailment
+    "yelp": 0,
+    "qnli": 1,
+    "qqp":  2,
+    "mnli": 3,
 }
 
-# HuggingFace loader config per task.
-# Yelp Polarity has no validation split — a 10k holdout is carved from train.
 DATASET_CONFIG = {
-    "yelp": {"hf_path": "yelp_polarity", "hf_name": None,   "val_split": "validation"},
-    "qnli": {"hf_path": "glue",          "hf_name": "qnli", "val_split": "validation"},
-    "qqp":  {"hf_path": "glue",          "hf_name": "qqp",  "val_split": "validation"},
-    "mnli": {"hf_path": "glue",          "hf_name": "mnli", "val_split": "validation_matched"},
+    "yelp": {"hf_path": "yelp_polarity", "hf_name": None},
+    "qnli": {"hf_path": "glue",          "hf_name": "qnli"},
+    "qqp":  {"hf_path": "glue",          "hf_name": "qqp"},
+    "mnli": {"hf_path": "glue",          "hf_name": "mnli"},
 }
 
-YELP_VAL_SIZE = 10_000
+# 60 / 20 / 20 split parameters
+SPLIT_SEED   = 42
+TEST_SIZE    = 0.20    # 20 % of full train → test
+VAL_FRACTION = 0.25    # 25 % of remaining 80 % → val  (= 20 % of full)
 
 
 def get_tokenizer(model_name: str):
@@ -60,14 +56,7 @@ def _preprocess_function_builder(task_name: str, tokenizer, max_length: int):
     def preprocess(example):
         text1 = example[key1]
         text2 = example[key2] if key2 is not None else None
-
-        encoded = tokenizer(
-            text1,
-            text2,
-            truncation=True,
-            max_length=max_length,
-        )
-
+        encoded = tokenizer(text1, text2, truncation=True, max_length=max_length)
         encoded["labels"]    = example["label"]
         encoded["task_name"] = task_name
         encoded["task_id"]   = TASK_NAME_TO_ID[task_name]
@@ -78,27 +67,21 @@ def _preprocess_function_builder(task_name: str, tokenizer, max_length: int):
 
 def download_and_process_all(model_name: str, max_length: int, processed_dir: str):
     """
-    Downloads and tokenizes all 4 tasks, saves to disk.
-    Skips tasks that are already processed.
-
-    Tasks: Yelp Polarity (sentiment), QNLI, QQP, MNLI.
-    Note: Yelp Polarity is loaded from "yelp_polarity"; GLUE tasks from "glue".
-    Note: Yelp has no validation split — last YELP_VAL_SIZE examples of train
-          are carved out and saved as a "validation" split.
+    Downloads, tokenizes, and splits every task into 60 / 20 / 20
+    train / val / test from the HuggingFace training split only.
+    Skips tasks already cached on disk.
     """
     tokenizer = get_tokenizer(model_name)
     os.makedirs(processed_dir, exist_ok=True)
 
     for task_name in TASK_NAME_TO_ID:
         save_path = os.path.join(processed_dir, task_name)
-
         if os.path.exists(save_path):
             print(f"[skip] {task_name} already processed at {save_path}")
             continue
 
         print(f"[load] {task_name}")
         ds_cfg = DATASET_CONFIG[task_name]
-
         if ds_cfg["hf_name"] is not None:
             raw_ds = load_dataset(ds_cfg["hf_path"], ds_cfg["hf_name"])
         else:
@@ -106,20 +89,35 @@ def download_and_process_all(model_name: str, max_length: int, processed_dir: st
 
         preprocess_fn = _preprocess_function_builder(task_name, tokenizer, max_length)
 
-        tokenized = raw_ds.map(
+        tokenized_train = raw_ds["train"].map(
             preprocess_fn,
             batched=False,
             remove_columns=raw_ds["train"].column_names,
         )
 
-        # Yelp has no validation split — carve last YELP_VAL_SIZE rows from train
-        if task_name == "yelp":
-            full_train = tokenized["train"]
-            total = len(full_train)
-            tokenized["train"]      = full_train.select(range(0, total - YELP_VAL_SIZE))
-            tokenized["validation"] = full_train.select(range(total - YELP_VAL_SIZE, total))
+        # ── 60 / 20 / 20 split ────────────────────────────────────────────────
+        # Step 1: carve 20 % as test
+        split1     = tokenized_train.train_test_split(test_size=TEST_SIZE, seed=SPLIT_SEED)
+        train_val  = split1["train"]   # 80 % of original
+        test_split = split1["test"]    # 20 % of original
 
-        tokenized.save_to_disk(save_path)
+        # Step 2: split 80 % → 75 % train / 25 % val  (= 60 % / 20 % of original)
+        split2      = train_val.train_test_split(test_size=VAL_FRACTION, seed=SPLIT_SEED)
+        train_split = split2["train"]  # 60 % of original
+        val_split   = split2["test"]   # 20 % of original
+
+        print(
+            f"[split] {task_name}: "
+            f"train={len(train_split):,}  "
+            f"val={len(val_split):,}  "
+            f"test={len(test_split):,}"
+        )
+
+        DatasetDict({
+            "train":      train_split,
+            "validation": val_split,
+            "test":       test_split,
+        }).save_to_disk(save_path)
         print(f"[saved] {task_name} -> {save_path}")
 
 
@@ -129,10 +127,8 @@ def load_processed_task(task_name: str, processed_dir: str):
 
 
 class TaskAwareCollator:
-    """
-    Handles dynamic padding via DataCollatorWithPadding and
-    restores task_id / task_name into the final batch.
-    """
+    """Dynamic padding via DataCollatorWithPadding; restores task_id / task_name."""
+
     def __init__(self, tokenizer):
         self.base_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
@@ -161,17 +157,15 @@ def make_single_task_dataloaders(
     num_workers: int = 0,
 ) -> Dict[str, Dict[str, DataLoader]]:
     """
-    Returns {task_name: {"train": DataLoader, "val": DataLoader}}
-    for all 4 tasks. Val split is task-specific (see DATASET_CONFIG).
+    Returns {task_name: {"train": DataLoader, "val": DataLoader, "test": DataLoader}}
+    using the pre-computed 60 / 20 / 20 splits.
     """
     tokenizer = get_tokenizer(model_name)
     collator  = TaskAwareCollator(tokenizer)
 
     loaders = {}
     for task_name in TASK_NAME_TO_ID:
-        ds        = load_processed_task(task_name, processed_dir)
-        val_split = DATASET_CONFIG[task_name]["val_split"]
-
+        ds = load_processed_task(task_name, processed_dir)
         loaders[task_name] = {
             "train": DataLoader(
                 ds["train"],
@@ -181,7 +175,14 @@ def make_single_task_dataloaders(
                 num_workers=num_workers,
             ),
             "val": DataLoader(
-                ds[val_split],
+                ds["validation"],
+                batch_size=eval_batch_size,
+                shuffle=False,
+                collate_fn=collator,
+                num_workers=num_workers,
+            ),
+            "test": DataLoader(
+                ds["test"],
                 batch_size=eval_batch_size,
                 shuffle=False,
                 collate_fn=collator,
@@ -195,8 +196,8 @@ def make_single_task_dataloaders(
 class UniformMultiTaskIterator:
     def __init__(self, task_loaders: Dict[str, DataLoader]):
         self.task_loaders = task_loaders
-        self.tasks = list(task_loaders.keys())
-        self._iterators = {task: iter(loader) for task, loader in task_loaders.items()}
+        self.tasks        = list(task_loaders.keys())
+        self._iterators   = {t: iter(l) for t, l in task_loaders.items()}
 
     def __iter__(self) -> Iterator:
         return self
@@ -211,7 +212,7 @@ class UniformMultiTaskIterator:
         return batch
 
     def steps_per_epoch(self) -> int:
-        return max(len(loader) for loader in self.task_loaders.values())
+        return max(len(l) for l in self.task_loaders.values())
 
 
 def make_multitask_train_iterator(
@@ -220,10 +221,6 @@ def make_multitask_train_iterator(
     train_batch_size: int,
     num_workers: int = 0,
 ) -> UniformMultiTaskIterator:
-    """
-    Builds per-task train dataloaders and wraps them in
-    UniformMultiTaskIterator for balanced multitask training.
-    """
     loaders = make_single_task_dataloaders(
         model_name=model_name,
         processed_dir=processed_dir,
@@ -231,5 +228,4 @@ def make_multitask_train_iterator(
         eval_batch_size=train_batch_size,
         num_workers=num_workers,
     )
-    train_loaders = {k: v["train"] for k, v in loaders.items()}
-    return UniformMultiTaskIterator(train_loaders)
+    return UniformMultiTaskIterator({k: v["train"] for k, v in loaders.items()})
