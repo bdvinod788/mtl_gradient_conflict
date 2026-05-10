@@ -14,7 +14,7 @@ loss.
 ├── model.py                    # DistilBERT shared encoder + 4 task heads
 ├── data.py                     # data loaders, test-split carving
 ├── config.py                   # task configs and hyperparameters
-├── gradient_signals.py         # six-signal logger (severity, SNR, etc.)
+├── gradient_signals.py         # five-signal logger (severity, SNR, etc.)
 │
 ├── plot_all_graphs.py          # 19 per-run plots from training_history.json
 ├── plot_severity_vs_val.py     # severity-vs-val-loss alignment figure
