@@ -1,171 +1,231 @@
 """
-data.py
-Loads GLUE tasks from HuggingFace datasets and provides a uniform-sampling
-multi-task dataloader that cycles through tasks to handle size imbalance.
+data.py  (PCGrad version)
 
-Identical to vanilla/data.py — kept as a local copy so the pcgrad/ folder
-is fully self-contained and runnable without depending on any sibling directory.
+Loads tasks from HuggingFace (Yelp Polarity, QNLI, QQP, MNLI), tokenizes, and
+saves to disk with a reproducible 60 / 20 / 20 train / val / test split carved
+entirely from the HuggingFace training split (GLUE test sets have no labels).
+
+Split ratios
+------------
+  train : 60 %   used during training
+  val   : 20 %   used for mid-epoch and epoch-end evaluation
+  test  : 20 %   held out — evaluated once after training completes
+
+Identical interface to the previous version; `make_single_task_dataloaders`
+now returns an extra "test" key in each task's dict.
 """
 
-from __future__ import annotations
+import os
 import random
-from itertools import cycle
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator
 
 import torch
-from torch.utils.data import DataLoader, Dataset
-from datasets import load_dataset
-from transformers import DistilBertTokenizerFast
+from torch.utils.data import DataLoader
+from datasets import load_dataset, load_from_disk, DatasetDict
+from transformers import AutoTokenizer, DataCollatorWithPadding
 
-from model import TASKS
+from config import TASK_CONFIG
 
-# ── Task-specific field extractors ────────────────────────────────────────────
-# Each returns (sentence_a, sentence_b_or_None, label)
-
-def _extract_sst2(example):
-    return example["sentence"], None, example["label"]
-
-def _extract_qnli(example):
-    return example["question"], example["sentence"], example["label"]
-
-def _extract_qqp(example):
-    return example["question1"], example["question2"], example["label"]
-
-def _extract_mnli(example):
-    return example["premise"], example["hypothesis"], example["label"]
-
-EXTRACTORS = {
-    "sst2": _extract_sst2,
-    "qnli": _extract_qnli,
-    "qqp":  _extract_qqp,
-    "mnli": _extract_mnli,
+TASK_NAME_TO_ID = {
+    "yelp": 0,
+    "qnli": 1,
+    "qqp":  2,
+    "mnli": 3,
 }
 
-# HuggingFace dataset names & config keys
-HF_CONFIGS = {
-    "sst2": ("glue", "sst2"),
-    "qnli": ("glue", "qnli"),
-    "qqp":  ("glue", "qqp"),
-    "mnli": ("glue", "mnli"),
+DATASET_CONFIG = {
+    "yelp": {"hf_path": "yelp_polarity", "hf_name": None},
+    "qnli": {"hf_path": "glue",          "hf_name": "qnli"},
+    "qqp":  {"hf_path": "glue",          "hf_name": "qqp"},
+    "mnli": {"hf_path": "glue",          "hf_name": "mnli"},
 }
 
-# MNLI validation split name
-MNLI_VAL_SPLIT = "validation_matched"
+# 60 / 20 / 20 split parameters
+SPLIT_SEED   = 42
+TEST_SIZE    = 0.20    # 20 % of full train → test
+VAL_FRACTION = 0.25    # 25 % of remaining 80 % → val  (= 20 % of full)
 
 
-class GLUETaskDataset(Dataset):
+def get_tokenizer(model_name: str):
+    return AutoTokenizer.from_pretrained(model_name)
+
+
+def _preprocess_function_builder(task_name: str, tokenizer, max_length: int):
+    key1, key2 = TASK_CONFIG[task_name]["input_keys"]
+
+    def preprocess(example):
+        text1 = example[key1]
+        text2 = example[key2] if key2 is not None else None
+        encoded = tokenizer(text1, text2, truncation=True, max_length=max_length)
+        encoded["labels"]    = example["label"]
+        encoded["task_name"] = task_name
+        encoded["task_id"]   = TASK_NAME_TO_ID[task_name]
+        return encoded
+
+    return preprocess
+
+
+def download_and_process_all(model_name: str, max_length: int, processed_dir: str):
     """
-    Wraps a single GLUE task split as a torch Dataset.
-    Tokenization is LAZY — done per example in __getitem__ rather than
-    upfront in __init__. This keeps RAM usage flat regardless of dataset
-    size, fixing OOM kills on large tasks like QQP and MNLI.
+    Downloads, tokenizes, and splits every task into 60 / 20 / 20
+    train / val / test from the HuggingFace training split only.
+    Skips tasks already cached on disk.
     """
+    tokenizer = get_tokenizer(model_name)
+    os.makedirs(processed_dir, exist_ok=True)
 
-    def __init__(
-        self,
-        task: str,
-        split: str,
-        tokenizer: DistilBertTokenizerFast,
-        max_length: int = 128,
-        max_samples: Optional[int] = None,
-    ):
-        hf_path, hf_name = HF_CONFIGS[task]
+    for task_name in TASK_NAME_TO_ID:
+        save_path = os.path.join(processed_dir, task_name)
+        if os.path.exists(save_path):
+            print(f"[skip] {task_name} already processed at {save_path}")
+            continue
 
-        actual_split = split
-        if task == "mnli" and split == "validation":
-            actual_split = MNLI_VAL_SPLIT
+        print(f"[load] {task_name}")
+        ds_cfg = DATASET_CONFIG[task_name]
+        if ds_cfg["hf_name"] is not None:
+            raw_ds = load_dataset(ds_cfg["hf_path"], ds_cfg["hf_name"])
+        else:
+            raw_ds = load_dataset(ds_cfg["hf_path"])
 
-        raw = load_dataset(hf_path, hf_name, split=actual_split)
+        preprocess_fn = _preprocess_function_builder(task_name, tokenizer, max_length)
 
-        if max_samples is not None:
-            raw = raw.select(range(min(max_samples, len(raw))))
-
-        # Filter out unlabelled test rows (label == -1) upfront
-        raw = raw.filter(lambda ex: EXTRACTORS[task](ex)[2] != -1)
-
-        # Store raw text + labels only — no tokenization yet
-        self.raw = raw
-        self.task = task
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.extractor = EXTRACTORS[task]
-
-    def __len__(self):
-        return len(self.raw)
-
-    def __getitem__(self, idx):
-        ex = self.raw[idx]
-        sent_a, sent_b, label = self.extractor(ex)
-
-        enc = self.tokenizer(
-            sent_a,
-            sent_b,
-            max_length=self.max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
+        tokenized_train = raw_ds["train"].map(
+            preprocess_fn,
+            batched=False,
+            remove_columns=raw_ds["train"].column_names,
         )
 
-        return {
-            "input_ids":      enc["input_ids"].squeeze(0),
-            "attention_mask": enc["attention_mask"].squeeze(0),
-            "labels":         torch.tensor(label, dtype=torch.long),
+        # ── 60 / 20 / 20 split ────────────────────────────────────────────────
+        # Step 1: carve 20 % as test
+        split1     = tokenized_train.train_test_split(test_size=TEST_SIZE, seed=SPLIT_SEED)
+        train_val  = split1["train"]   # 80 % of original
+        test_split = split1["test"]    # 20 % of original
+
+        # Step 2: split 80 % → 75 % train / 25 % val  (= 60 % / 20 % of original)
+        split2      = train_val.train_test_split(test_size=VAL_FRACTION, seed=SPLIT_SEED)
+        train_split = split2["train"]  # 60 % of original
+        val_split   = split2["test"]   # 20 % of original
+
+        print(
+            f"[split] {task_name}: "
+            f"train={len(train_split):,}  "
+            f"val={len(val_split):,}  "
+            f"test={len(test_split):,}"
+        )
+
+        DatasetDict({
+            "train":      train_split,
+            "validation": val_split,
+            "test":       test_split,
+        }).save_to_disk(save_path)
+        print(f"[saved] {task_name} -> {save_path}")
+
+
+def load_processed_task(task_name: str, processed_dir: str):
+    path = os.path.join(processed_dir, task_name)
+    return load_from_disk(path)
+
+
+class TaskAwareCollator:
+    """Dynamic padding via DataCollatorWithPadding; restores task_id / task_name."""
+
+    def __init__(self, tokenizer):
+        self.base_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+
+    def __call__(self, features):
+        task_ids   = [f["task_id"]   for f in features]
+        task_names = [f["task_name"] for f in features]
+
+        stripped = []
+        for f in features:
+            x = dict(f)
+            x.pop("task_name", None)
+            x.pop("task_id",   None)
+            stripped.append(x)
+
+        batch = self.base_collator(stripped)
+        batch["task_id"]   = torch.tensor(task_ids, dtype=torch.long)
+        batch["task_name"] = task_names
+        return batch
+
+
+def make_single_task_dataloaders(
+    model_name: str,
+    processed_dir: str,
+    train_batch_size: int,
+    eval_batch_size: int,
+    num_workers: int = 0,
+) -> Dict[str, Dict[str, DataLoader]]:
+    """
+    Returns {task_name: {"train": DataLoader, "val": DataLoader, "test": DataLoader}}
+    using the pre-computed 60 / 20 / 20 splits.
+    """
+    tokenizer = get_tokenizer(model_name)
+    collator  = TaskAwareCollator(tokenizer)
+
+    loaders = {}
+    for task_name in TASK_NAME_TO_ID:
+        ds = load_processed_task(task_name, processed_dir)
+        loaders[task_name] = {
+            "train": DataLoader(
+                ds["train"],
+                batch_size=train_batch_size,
+                shuffle=True,
+                collate_fn=collator,
+                num_workers=num_workers,
+            ),
+            "val": DataLoader(
+                ds["validation"],
+                batch_size=eval_batch_size,
+                shuffle=False,
+                collate_fn=collator,
+                num_workers=num_workers,
+            ),
+            "test": DataLoader(
+                ds["test"],
+                batch_size=eval_batch_size,
+                shuffle=False,
+                collate_fn=collator,
+                num_workers=num_workers,
+            ),
         }
 
-
-def build_task_dataloaders(
-    tokenizer: DistilBertTokenizerFast,
-    split: str = "train",
-    batch_size: int = 32,
-    max_length: int = 128,
-    max_samples_per_task: Optional[int] = None,
-    num_workers: int = 2,
-) -> Dict[str, DataLoader]:
-    """Returns a dict of {task: DataLoader} for the given split."""
-    loaders = {}
-    for task in TASKS:
-        ds = GLUETaskDataset(
-            task=task,
-            split=split,
-            tokenizer=tokenizer,
-            max_length=max_length,
-            max_samples=max_samples_per_task,
-        )
-        shuffle = (split == "train")
-        loaders[task] = DataLoader(
-            ds,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
-        )
     return loaders
 
 
-class UniformMTLSampler:
-    """
-    Uniform task sampler: at each step, randomly pick a task and yield
-    the next batch from that task's dataloader (cycling infinitely).
-    Handles dataset size imbalance as described in the proposal.
-    """
-
+class UniformMultiTaskIterator:
     def __init__(self, task_loaders: Dict[str, DataLoader]):
         self.task_loaders = task_loaders
-        self._iterators: Dict[str, Iterator] = {
-            task: cycle(loader) for task, loader in task_loaders.items()
-        }
-        self.tasks = list(task_loaders.keys())
+        self.tasks        = list(task_loaders.keys())
+        self._iterators   = {t: iter(l) for t, l in task_loaders.items()}
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator:
         return self
 
     def __next__(self):
         task = random.choice(self.tasks)
-        batch = next(self._iterators[task])
-        return task, batch
+        try:
+            batch = next(self._iterators[task])
+        except StopIteration:
+            self._iterators[task] = iter(self.task_loaders[task])
+            batch = next(self._iterators[task])
+        return batch
 
     def steps_per_epoch(self) -> int:
-        """
-        One epoch = one pass through the largest task dataset.
-        """
-        return max(len(loader) for loader in self.task_loaders.values())
+        return max(len(l) for l in self.task_loaders.values())
+
+
+def make_multitask_train_iterator(
+    model_name: str,
+    processed_dir: str,
+    train_batch_size: int,
+    num_workers: int = 0,
+) -> UniformMultiTaskIterator:
+    loaders = make_single_task_dataloaders(
+        model_name=model_name,
+        processed_dir=processed_dir,
+        train_batch_size=train_batch_size,
+        eval_batch_size=train_batch_size,
+        num_workers=num_workers,
+    )
+    return UniformMultiTaskIterator({k: v["train"] for k, v in loaders.items()})

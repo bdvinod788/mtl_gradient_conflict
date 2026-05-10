@@ -46,14 +46,14 @@ import numpy as np
 VANILLA_COLOR = "#4C9BE8"   # blue
 PCGRAD_COLOR  = "#E87C4C"   # orange
 TASK_COLORS   = {
-    "sst2": "#5C85D6",
+    "yelp": "#5C85D6",
     "qnli": "#56B87E",
     "qqp":  "#D6A23C",
     "mnli": "#C7567A",
 }
-TASK_MARKERS  = {"sst2": "o", "qnli": "s", "qqp": "^", "mnli": "D"}
+TASK_MARKERS  = {"yelp": "o", "qnli": "s", "qqp": "^", "mnli": "D"}
 TASK_LABELS   = {
-    "sst2": "SST-2 (Sentiment)",
+    "yelp": "Yelp (Sentiment)",
     "qnli": "QNLI (NLI)",
     "qqp":  "QQP (Paraphrase)",
     "mnli": "MNLI (3-class NLI)",
@@ -223,14 +223,14 @@ def plot_conflict_rate(
     """Gradient conflict rate over epochs."""
     fig, ax = plt.subplots(figsize=(8, 5))
     epochs1 = _extract(history1, "epoch")
-    rate1   = _extract(history1, "gradient_conflict_rate")
+    rate1   = _extract(history1, "conflict_rate")
 
     ax.plot(epochs1, rate1, color=VANILLA_COLOR, linewidth=2,
             marker="o", markersize=5, label=title1)
 
     if history2:
         epochs2 = _extract(history2, "epoch")
-        rate2   = _extract(history2, "gradient_conflict_rate")
+        rate2   = _extract(history2, "conflict_rate")
         ax.plot(epochs2, rate2, color=PCGRAD_COLOR, linewidth=2,
                 marker="o", markersize=5, linestyle="--", label=title2)
 
@@ -352,7 +352,7 @@ def plot_summary_grid(
     axes[0, 1].set_ylabel("Accuracy (%)")
     axes[0, 1].legend(fontsize=9)
 
-    _plot(axes[1, 0], "gradient_conflict_rate", "Conflict Rate",
+    _plot(axes[1, 0], "conflict_rate", "Conflict Rate",
           "Gradient Conflict Rate", pct=True)
     axes[1, 0].set_ylim(0, 1)
 
@@ -405,7 +405,7 @@ def print_final_table(history1, title1, history2=None, title2=None):
     print(row)
 
     print("-" * 70)
-    for key, label in [("gradient_conflict_rate", "Conflict Rate"),
+    for key, label in [("conflict_rate", "Conflict Rate"),
                         ("combined_gradient_score", "GCS")]:
         v1  = last1[key]
         row = f"{label:<14}  {v1:.4f}"
